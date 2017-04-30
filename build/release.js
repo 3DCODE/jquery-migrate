@@ -4,12 +4,13 @@
  */
 
 // Debugging variables
-var	debug = false,
+var	dryrun = false,
 	skipRemote = false;
 
-var fs = require("fs"),
-	child = require("child_process"),
-	path = require("path");
+var fs = require( "fs" ),
+	child = require( "child_process" ),
+	path = require( "path" ),
+	chalk = require( "chalk" );
 
 var releaseVersion,
 	nextVersion,
@@ -17,45 +18,57 @@ var releaseVersion,
 	isBeta,
 	pkg,
 
-	scpURL = "jqadmin@code.origin.jquery.com:/var/www/html/code.jquery.com/",
-	cdnURL = "http://code.origin.jquery.com/",
 	repoURL = "git@github.com:jquery/jquery-migrate.git",
-	branch = "master",
+	branch = "1.x-stable",
 
 	// Windows needs the .cmd version but will find the non-.cmd
-	// On Windows, ensure the HOME environment variable is set
+	// On Windows, also ensure the HOME environment variable is set
 	gruntCmd = process.platform === "win32" ? "grunt.cmd" : "grunt",
+	npmCmd = process.platform == "win32" ? "npm.cmd" : "npm",
 
 	readmeFile = "README.md",
 	packageFile = "package.json",
-	pluginFile = "migrate.jquery.json",
+	versionFile = "src/version.js",
 	devFile = "dist/jquery-migrate.js",
 	minFile = "dist/jquery-migrate.min.js",
 
 	releaseFiles = {
-		"jquery-migrate-VER.js": devFile,
-		"jquery-migrate-VER.min.js": minFile
+		"CDN/jquery-migrate-VER.js": devFile,
+		"CDN/jquery-migrate-VER.min.js": minFile
 	};
 
 steps(
 	initialize,
 	checkGitStatus,
-	updateReadme,
+	function( next ) { gruntBuild( "default", next ); },
+	updateVersions,
 	tagReleaseVersion,
-	gruntBuild,
+	function( next ) { gruntBuild( "buildnounit", next ); },
 	makeReleaseCopies,
+
+	publishToNPM,
 	setNextVersion,
-	uploadToCDN,
 	pushToRemote,
+	remindAboutCDN,
 	exit
 );
 
 function initialize( next ) {
 
+	// -d dryrun mode, no commands are executed at all
 	if ( process.argv[2] === "-d" ) {
 		process.argv.shift();
-		debug = true;
-		console.warn("=== DEBUG MODE ===" );
+		dryrun = true;
+		console.warn("=== DRY RUN MODE ===" );
+	}
+
+	// -r skip remote mode, no remote commands are executed
+	// (git push, npm publish, cdn copy)
+	// Reset with `git reset --hard HEAD~2 && git tag -d (version) && grunt`
+	if ( process.argv[2] === "-r" ) {
+		process.argv.shift();
+		skipRemote = true;
+		console.warn("=== SKIPREMOTE MODE ===" );
 	}
 
 	// First arg should be the version number being released; this is a proper subset
@@ -74,7 +87,10 @@ function initialize( next ) {
 	isBeta = !!xbeta;
 
 	if ( !releaseVersion ) {
-		die( "Usage: release [ -d ] releaseVersion" );
+		log( "Usage: release [ -d -r ] releaseVersion" );
+		log( "       -d  Dry-run; no commands are executed at all" );
+		log( "       -r  Skip-remote; nothing is pushed externally" );
+		die( "Invalid args" );
 	}
 	if ( !version.length ) {
 		die( "'" + releaseVersion + "' is not a valid semver!" );
@@ -87,7 +103,7 @@ function initialize( next ) {
 	}
 	pkg = JSON.parse( fs.readFileSync( packageFile ) );
 
-	log( "Current version is " + pkg.version + "; generating release " + releaseVersion );
+	status( "Current version is " + pkg.version + "; generating release " + releaseVersion );
 	version = rsemver.exec( pkg.version );
 	oldver = ( +version[1] ) * 10000 + ( +version[2] * 100 ) + ( +version[3] )
 	newver = ( +major ) * 10000 + ( +minor * 100 ) + ( +patch );
@@ -121,33 +137,20 @@ function checkGitStatus( next ) {
 }
 
 function tagReleaseVersion( next ) {
-	updatePackageVersion( releaseVersion );
-	updatePluginVersion( releaseVersion );
-	git( [ "commit", "-a", "-m", "Tagging the " + releaseVersion + " release." ], function(){
+	git( [ "commit", "-a", "--no-verify", "-m", "Tagging the " + releaseVersion + " release." ], function(){
 		git( [ "tag", releaseVersion ], next);
 	});
 }
 
-function updateReadme( next ) {
-	var readme = fs.readFileSync( readmeFile, "utf8" );
-
-	// Change version references from the old version to the new one;
-	// Only release versions should be updated which simplifies the regex
-	if ( isBeta ) {
-		log( "Skipping " + readmeFile + " update (beta release)" );
-	} else { 
-		log( "Updating " + readmeFile );
-		readme = readme
-			.replace( /jquery-migrate-\d+\.\d+\.\d+/g, "jquery-migrate-" + releaseVersion );
-		if ( !debug ) {
-			fs.writeFileSync( readmeFile, readme );
-		}
-	}
+function updateVersions( next ) {
+	updateSourceVersion( releaseVersion );
+	updateReadmeVersion( releaseVersion );
+	updatePackageVersion( releaseVersion );
 	next();
 }
 
-function gruntBuild( next ) {
-	exec( gruntCmd, [], function( error, stdout ) {
+function gruntBuild( target, next ) {
+	exec( gruntCmd, [ target || "default" ], function( error, stdout ) {
 		if ( error ) {
 			die( error + stderr );
 		}
@@ -168,31 +171,30 @@ function makeReleaseCopies( next ) {
 	next();
 }
 
-function setNextVersion( next ) {
-	updatePackageVersion( nextVersion, "master" );
-	git( [ "commit", "-a", "-m", "Updating the source version to " + nextVersion ], next );
+function publishToNPM( next ) {
+
+	// Don't update "latest" if this is a beta
+	if ( isBeta ) {
+		exec( npmCmd, [ "publish", "--tag", releaseVersion ], next, skipRemote );
+	} else {
+		exec( npmCmd, [ "publish" ], next, skipRemote );
+	}
 }
 
-function uploadToCDN( next ) {
-	var cmds = [];
-
-	Object.keys( finalFiles ).forEach(function( name ) {
-		cmds.push(
-			function( nxt ){
-				exec( "scp", [ name, scpURL ], nxt, skipRemote );
-			},
-			function( nxt ){
-				exec( "curl", [ cdnURL + name + "?reload" ], nxt, skipRemote );
-			}
-		);
-	});
-	cmds.push( next );
-	
-	steps.apply( this, cmds );
+function setNextVersion( next ) {
+	updateSourceVersion( nextVersion );
+	updatePackageVersion( nextVersion, branch );
+	git( [ "commit", "-a", "--no-verify", "-m", "Updating the source version to " + nextVersion ], next );
 }
 
 function pushToRemote( next ) {
 	git( [ "push", "--tags", repoURL, branch ], next, skipRemote );
+}
+
+function remindAboutCDN( next ) {
+	console.log( chalk.red( "TODO: Update CDN with jquery-migrate." + releaseVersion + " files (min and regular)" ) );
+	console.log( chalk.red( "  clone codeorigin.jquery.org, git add files, commit, push" ) );
+	next();
 }
 
 //==============================
@@ -208,32 +210,46 @@ function steps() {
 }
 
 function updatePackageVersion( ver, blobVer ) {
-	log( "Updating " + packageFile + " version to " + ver );
+	status( "Updating " + packageFile + " version to " + ver );
 	blobVer = blobVer || ver;
 	pkg.version = ver;
 	pkg.author.url = setBlobVersion( pkg.author.url, blobVer );
-	pkg.licenses[0].url = setBlobVersion( pkg.licenses[0].url, blobVer );
+
 	writeJsonSync( packageFile, pkg );
 }
 
-function updatePluginVersion( ver ) {
-	var plug;
+function updateSourceVersion( ver ) {
+	var stmt = "\njQuery.migrateVersion = \"" + ver + "\";\n";
 
-	log( "Updating " + pluginFile + " version to " + ver );
-	plug = JSON.parse( fs.readFileSync( pluginFile ) );
-	plug.version = ver;
-	plug.author.url = setBlobVersion( plug.author.url, ver );
-	plug.licenses[0].url = setBlobVersion( plug.licenses[0].url, ver );
-	plug.download = setBlobVersion( plug.download, ver );
-	writeJsonSync( pluginFile, plug );
+	status( "Updating " + stmt.replace( /\n/g, "" ) );
+	if ( !dryrun ) {
+		fs.writeFileSync( versionFile, stmt );
+	}
+}
+
+function updateReadmeVersion( ver ) {
+	var readme = fs.readFileSync( readmeFile, "utf8" );
+
+	// Change version references from the old version to the new one;
+	// Only release versions should be updated which simplifies the regex
+	if ( isBeta ) {
+		status( "Skipping " + readmeFile + " update (beta release)" );
+	} else {
+		status( "Updating " + readmeFile );
+		readme = readme
+			.replace( /jquery-migrate-\d+\.\d+\.\d+/g, "jquery-migrate-" + releaseVersion );
+		if ( !dryrun ) {
+			fs.writeFileSync( readmeFile, readme );
+		}
+	}
 }
 
 function setBlobVersion( s, v ) {
-	return s.replace( /\/blob\/(?:(\d+\.\d+[^\/]+)|master)/, "/blob/" + v );
+	return s.replace( /\/blob\/[^\/]+/, "/blob/" + v );
 }
 
 function writeJsonSync( fname, json ) {
-	if ( debug ) {
+	if ( dryrun ) {
 		console.log( JSON.stringify( json, null, "  " ) );
 	} else {
 		fs.writeFileSync( fname, JSON.stringify( json, null, "\t" ) + "\n" );
@@ -241,8 +257,8 @@ function writeJsonSync( fname, json ) {
 }
 
 function copy( oldFile, newFile ) {
-	log( "Copying " + oldFile + " to " + newFile );
-	if ( !debug ) {
+	status( "Copying " + oldFile + " to " + newFile );
+	if ( !dryrun ) {
 		fs.writeFileSync( newFile, fs.readFileSync( oldFile, "utf8" ) );
 	}
 }
@@ -252,11 +268,11 @@ function git( args, fn, skip ) {
 }
 
 function exec( cmd, args, fn, skip ) {
-	if ( debug || skip ) {
-		log( "# " + cmd + " " + args.join(" ") );
+	if ( dryrun || skip ) {
+		log( chalk.black.bgBlue( "# " + cmd + " " + args.join(" ") ) );
 		fn();
 	} else {
-		log( cmd + " " + args.join(" ") );
+		log( chalk.green( cmd + " " + args.join(" ") ) );
 		child.execFile( cmd, args, { env: process.env }, 
 			function( err, stdout, stderr ) {
 				if ( err ) {
@@ -268,12 +284,16 @@ function exec( cmd, args, fn, skip ) {
 	}
 }
 
+function status( msg ) {
+	console.log( chalk.black.bgGreen( msg ) );
+}
+
 function log( msg ) {
 	console.log( msg );
 }
 
 function die( msg ) {
-	console.error( "ERROR: " + msg );
+	console.error( chalk.red( "ERROR: " + msg ) );
 	process.exit( 1 );
 }
 
